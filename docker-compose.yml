@@ -1,0 +1,24 @@
+version: "3.8"
+services:
+  app:
+    build: .
+    container_name: ytdlp_app
+    restart: unless-stopped
+    volumes:
+      - ./downloads:/app/downloads
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8000:8000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ytdlp_nginx
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/yt-dlp.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/logs:/var/log/nginx
+    restart: unless-stopped
