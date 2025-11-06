@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # OS deps + ffmpeg (yt-dlp koristi ffmpeg/ffprobe)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ffmpeg ca-certificates build-essential \
+      ffmpeg ca-certificates build-essential curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -19,20 +19,21 @@ WORKDIR /app
 # Brži/otporniji pip
 RUN python -m pip install --upgrade pip
 
-# Odradi upgrade yt-dlp na najnoviju verziju
-RUN pip install --upgrade yt-dlp
+# === KLJUČNO: yt-dlp nightly (master) zbog SABR promena ===
+# (umesto običnog "pip install --upgrade yt-dlp")
+RUN pip install --no-cache-dir "yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/refs/heads/master.zip"
 
-# Zavisnosti (u requirements.txt OBAVEZNO: Flask, yt-dlp, gunicorn)
+# Zavisnosti (u requirements.txt OBAVEZNO: Flask, gunicorn; yt-dlp nije neophodan ovde)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Aplikacija + cookies
-# (cookies.txt mora biti u root-u projekta pored app.py pre build-a)
+# (cookies.txt mora biti u root-u projekta pre build-a, ili montiraj preko volume-a)
 COPY . .
 # opciono: setuj permisije (ne mora, ali je uredno)
 RUN chmod 600 /app/cookies.txt || true
 
-# Ne definišemo VOLUME ovde; koristi se bind mount u compose-u po potrebi
+# Pripremi direktorijume
 RUN mkdir -p /app/public/downloads /data/ytpldl/work
 EXPOSE 8000
 
@@ -40,4 +41,3 @@ EXPOSE 8000
 CMD ["python", "-m", "gunicorn", \
      "--workers", "4", "--threads", "4", "--timeout", "3600", \
      "--bind", "0.0.0.0:8000", "app:app"]
-
