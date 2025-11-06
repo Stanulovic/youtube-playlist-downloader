@@ -1,28 +1,23 @@
 import os
 import re
 import uuid
-import glob
-import shutil
 import zipfile
+import shutil
 import traceback
 import threading
 from collections import deque
 from urllib.parse import quote
-
 from flask import Flask, request, jsonify, Response
 
 # ================== CONFIG ==================
-# Radni folder (nezippovan sadržaj) – overriduje se env varom na EC2
 DOWNLOAD_ROOT = os.environ.get("DOWNLOAD_ROOT", os.path.join(os.path.expanduser("~"), "Downloads"))
 os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
 
-# Javni folder koji Nginx služi pod /ytpldl/downloads/
 PUBLIC_DOWNLOADS = os.environ.get("PUBLIC_DOWNLOADS", "/app/public/downloads")
 os.makedirs(PUBLIC_DOWNLOADS, exist_ok=True)
 
 LOG_FILE_NAME = "failed_downloads.txt"
-
-jobs = {}  # memorija za aktivne downloade {job_id: {status, log, target_folder, public_zip, ...}}
+jobs = {}
 
 app = Flask(__name__)
 
@@ -52,7 +47,6 @@ def parse_artist_and_title(full_title: str):
 
 
 def post_process_filenames(target_folder: str, log):
-    """Preimenuj u 'Artist - Title.mp3', izbaci duplikate."""
     for filename in os.listdir(target_folder):
         if filename.lower().endswith(".mp3"):
             full_path = os.path.join(target_folder, filename)
@@ -62,10 +56,7 @@ def post_process_filenames(target_folder: str, log):
             new_path = os.path.join(target_folder, new_name)
             if os.path.exists(new_path) and new_path != full_path:
                 log(f"⚠️ Duplikat: {new_name} već postoji. Brišem {filename}")
-                try:
-                    os.remove(full_path)
-                except Exception:
-                    pass
+                os.remove(full_path)
                 continue
             if new_path != full_path:
                 try:
@@ -84,8 +75,6 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         print(f"[{job_id}] {msg}")
 
     job["status"] = "running"
-
-    # Radni folder: DOWNLOAD_ROOT/<naziv>
     safe_subdir = sanitize_filename(target_subdir) or "yt-dlp-downloads"
     target_folder = os.path.join(DOWNLOAD_ROOT, safe_subdir)
     os.makedirs(target_folder, exist_ok=True)
@@ -100,13 +89,9 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
             pass
 
     def log_failed(url, reason):
-        try:
-            with open(failed_log_path, "a", encoding="utf-8") as f:
-                f.write(f"{url} - {reason}\n")
-        except Exception:
-            pass
+        with open(failed_log_path, "a", encoding="utf-8") as f:
+            f.write(f"{url} - {reason}\n")
 
-    # Hook za minimalan i nespammy progres
     last_file = {"name": None}
 
     def hook(d):
@@ -130,14 +115,10 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         "outtmpl": os.path.join(target_folder, "%(title)s.%(ext)s"),
         "restrictfilenames": False,
         "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": preferred_quality,
-            }
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": preferred_quality}
         ],
         "ignoreerrors": True,
-        "noplaylist": False,  # preuzima celu playlistu ako URL jeste playlist
+        "noplaylist": False,
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [hook],
@@ -159,27 +140,23 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         # === ZIP ceo target_folder u PUBLIC_DOWNLOADS ===
         zip_name = f"{safe_subdir}.zip"
         tmp_zip_path = os.path.join(target_folder, zip_name)
-        try:
-            with zipfile.ZipFile(tmp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for root, _, files in os.walk(target_folder):
-                    for f in files:
-                        if f.lower().endswith(".mp3"):
-                            full = os.path.join(root, f)
-                            arc = os.path.relpath(full, start=target_folder)
-                            zf.write(full, arcname=arc)
-        except Exception as e:
-            log(f"⚠️ Problem pri ZIP-ovanju: {e}")
+        with zipfile.ZipFile(tmp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(target_folder):
+                for f in files:
+                    if f.lower().endswith(".mp3"):
+                        full = os.path.join(root, f)
+                        arc = os.path.relpath(full, start=target_folder)
+                        zf.write(full, arcname=arc)
 
         final_zip_path = os.path.join(PUBLIC_DOWNLOADS, zip_name)
         try:
-            if os.path.exists(final_zip_path):
-                os.remove(final_zip_path)
-        except Exception:
-            pass
-        try:
             os.replace(tmp_zip_path, final_zip_path)
-        except Exception as e:
-            log(f"⚠️ Ne mogu da prebacim ZIP u public: {e}")
+        except OSError:
+            try:
+                shutil.copy2(tmp_zip_path, final_zip_path)
+                os.remove(tmp_zip_path)
+            except Exception as e:
+                log(f"⚠️ Ne mogu da kopiram ZIP u public: {e}")
 
         public_link = f"/ytpldl/downloads/{quote(zip_name)}"
         job["public_zip"] = public_link
@@ -196,75 +173,53 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
 # ================== ROUTES ==================
 @app.route("/")
 def index():
-    # UI radi i pod pod-putanjom (/ytpldl/)
-    html = """
-    <!doctype html>
+    html = """<!doctype html>
     <meta charset="utf-8" />
     <title>yt-dlp Web UI</title>
     <style>
       body{font-family:system-ui,Arial,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem}
-      h1{margin-bottom:.5rem}
       input,textarea,button{width:100%;padding:.6rem;border:1px solid #ccc;border-radius:10px}
       button{cursor:pointer;margin-top:.5rem}
       #log{white-space:pre-wrap;background:#0a0a0a;color:#eaeaea;padding:1rem;
            border-radius:10px;height:300px;overflow-y:auto;font-size:15px;}
       .muted{color:#666}
-      .row{display:grid;grid-template-columns:1fr 1fr auto;gap:.5rem;align-items:center}
       a.btn{display:inline-block;margin-top:.5rem;font-weight:600}
     </style>
-
     <h1>yt-dlp Web UI</h1>
     <p class="muted">⚠️ Poštuj autorska prava i uslove korišćenja YouTube-a.</p>
-
     <label>Playlist ili video URL-ovi (jedan po liniji)</label>
     <textarea id="urls" rows="6"
       placeholder="https://www.youtube.com/playlist?list=...&#10;https://www.youtube.com/watch?v=..."></textarea>
-
     <label>Naziv foldera/ZIP-a</label>
     <input id="folder" value="Play Lista 1"/>
-
     <label>MP3 kvalitet (kbps: 128/192/256/320)</label>
     <input id="quality" value="192"/>
-
     <button id="startBtn">Pokreni</button>
-    <a class="btn" id="openDownloads" href="#" style="display:none;">📁 Otvori /downloads</a>
-
-    <h2>Log</h2>
     <div id="log">Spreman.</div>
-
     <script>
       const logBox = document.getElementById('log');
       const basePath = window.location.pathname.replace(/\\/$/, '');
       let currentJob = null;
       let lastLines = 0;
       let pollTimer = null;
-
       function appendLog(t){
         logBox.textContent += "\\n" + t;
         logBox.scrollTop = logBox.scrollHeight;
       }
-
       document.getElementById('startBtn').addEventListener('click', async ()=>{
         const urls = document.getElementById('urls').value.split('\\n').map(s=>s.trim()).filter(Boolean);
         const folder = document.getElementById('folder').value.trim() || 'yt-dlp-downloads';
         const quality = document.getElementById('quality').value.trim() || '192';
-
         const res = await fetch(`${basePath}/start`, {
           method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({urls,folder,quality})
         });
-
-        const data = await res.json().catch(()=>({error:'Nevažeći JSON'}));
-        if(!res.ok || data.error){
-          appendLog("❌ " + (data.error || res.statusText));
-          return;
-        }
+        const data = await res.json();
         currentJob = data.job_id;
         appendLog(`Pokrenut job: ${currentJob}`);
         startPolling();
       });
-
       function startPolling(){
         if(pollTimer) clearInterval(pollTimer);
         pollTimer = setInterval(async ()=>{
@@ -275,28 +230,21 @@ def index():
           const newLines = data.log.slice(lastLines);
           newLines.forEach(line=>appendLog(line));
           lastLines = data.log.length;
-
-          if(data.status==='done' || data.status==='error'){
+          if(data.status==='done'||data.status==='error'){
             clearInterval(pollTimer);
             appendLog(`\\nStatus: ${data.status}`);
-            if(data.target_folder) appendLog(`\\nOutput: ${data.target_folder}`);
             if(data.public_zip){
               appendLog(`\\nZIP: ${data.public_zip}`);
-              const a = document.createElement('a');
-              a.href = data.public_zip;
-              a.textContent = '⬇️ Preuzmi ZIP';
-              a.className = 'btn';
-              logBox.insertAdjacentElement('afterend', a);
-
-              const open = document.getElementById('openDownloads');
-              open.href = basePath + '/downloads/';
-              open.style.display = 'inline-block';
+              const a=document.createElement('a');
+              a.href=data.public_zip;
+              a.textContent='⬇️ Preuzmi ZIP';
+              a.className='btn';
+              logBox.insertAdjacentElement('afterend',a);
             }
           }
-        }, 1000);
+        },1000);
       }
-    </script>
-    """
+    </script>"""
     return Response(html, mimetype="text/html")
 
 
@@ -311,17 +259,9 @@ def start_job():
         return jsonify({"error": "Prosledi makar jedan URL."}), 400
 
     job_id = uuid.uuid4().hex[:8]
-    jobs[job_id] = {
-        "status": "queued",
-        "log": deque(maxlen=8000),
-        "target_folder": None,
-        "failed_log_path": None,
-        "public_zip": None,
-    }
-
+    jobs[job_id] = {"status": "queued", "log": deque(maxlen=8000), "public_zip": None}
     t = threading.Thread(target=run_job, args=(job_id, urls, folder, quality), daemon=True)
     t.start()
-
     return jsonify({"job_id": job_id})
 
 
@@ -330,25 +270,16 @@ def get_logs(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Nepoznat job."}), 404
-    return jsonify({
-        "status": job["status"],
-        "log": list(job["log"]),
-        "target_folder": job.get("target_folder"),
-        "failed_log_path": job.get("failed_log_path"),
-        "public_zip": job.get("public_zip"),
-    })
+    return jsonify({"status": job["status"], "log": list(job["log"]), "public_zip": job.get("public_zip")})
 
 
 @app.errorhandler(Exception)
 def handle_all_errors(e):
-    # Return JSON umesto generičnog 500
     trace = traceback.format_exc()
     print("=== INTERNAL ERROR ===")
     print(trace)
-    msg = getattr(e, "description", str(e))
-    return jsonify({"error": msg, "type": e.__class__.__name__}), 500
+    return jsonify({"error": str(e), "type": e.__class__.__name__}), 500
 
 
 if __name__ == "__main__":
-    # Lokalno – u produkciji koristi Gunicorn (npr. gunicorn -w 4 -t 3600 -b 0.0.0.0:8000 app:app)
     app.run(host="0.0.0.0", port=8000, debug=True)
