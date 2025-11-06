@@ -1,296 +1,382 @@
 import os
-import shlex
-import subprocess
-import pathlib
+import re
+import uuid
+import zipfile
+import shutil
+import traceback
 import threading
-import time
-import datetime as dt
-import html
-from uuid import uuid4
-from typing import Tuple, Dict, Any, Optional, List
+from collections import deque
+from urllib.parse import quote
+from flask import Flask, request, jsonify, Response, send_from_directory
 
-from flask import Flask, request, jsonify, send_from_directory, Response
+# ================== CONFIG ==================
+DOWNLOAD_ROOT = os.environ.get("DOWNLOAD_ROOT", os.path.join(os.path.expanduser("~"), "Downloads"))
+os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
 
-# === Konfiguracija iz okoline (možeš menjati u docker-compose) ===
-DOWNLOAD_ROOT = os.environ.get("DOWNLOAD_ROOT", "/data/ytpldl/work")
 PUBLIC_DOWNLOADS = os.environ.get("PUBLIC_DOWNLOADS", "/app/public/downloads")
-COOKIES = "/app/cookies.txt"  # ako ne postoji, yt-dlp će probati bez njih
+os.makedirs(PUBLIC_DOWNLOADS, exist_ok=True)
 
-# === Flask app ===
+# Putanja do cookies fajla unutar containera (može i preko ENV)
+COOKIE_FILE = os.environ.get("YTDLP_COOKIEFILE", "/app/cookies.txt")
+
+LOG_FILE_NAME = "failed_downloads.txt"
+jobs = {}
+
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False  # lepši UTF-8 JSON
 
-# === In-memory store za job-ove (volatile; resetuje se restartom procesa) ===
-jobs_lock = threading.Lock()
-jobs: Dict[str, Dict[str, Any]] = {}
+try:
+    import yt_dlp
+except ModuleNotFoundError:
+    raise SystemExit("yt_dlp nije instaliran. Pokreni: python -m pip install yt-dlp Flask")
 
-# === Utility ===
-def ensure_dir(path: str) -> None:
-    pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+# ================== HELPERS ==================
+def sanitize_filename(name: str) -> str:
+    return re.sub(r"[\\/*?:\"<>|]", "", name).strip()
 
-def run_cmd(cmd: List[str], log_fp) -> Tuple[int, str]:
-    """Pokreće komandu, loguje stdout/stderr u log fajl i vraća (rc, full_log_str)."""
-    pretty = " ".join(shlex.quote(c) for c in cmd)
-    log_fp.write(f">> {pretty}\n")
-    log_fp.flush()
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    output_lines = []
-    for line in p.stdout:
-        output_lines.append(line)
-        log_fp.write(line)
-        log_fp.flush()
-    rc = p.wait()
-    return rc, "".join(output_lines)
+def clean_title(title: str) -> str:
+    return re.sub(r"[\[\(].*?[\]\)]", "", title).strip()
 
-def ytdlp_download(url: str, out_dir: str, no_playlist: bool, log_fp) -> Tuple[int, str]:
-    """
-    Fallback na više YouTube klijenata zbog SABR promena:
-      ios -> web_creator -> tv_embedded -> web
-    Vraća (rc, last_log). rc==0 smatra se uspehom.
-    """
-    ensure_dir(out_dir)
+def parse_artist_and_title(full_title: str):
+    if "-" in full_title:
+        parts = full_title.split("-", 1)
+        artist = sanitize_filename(parts[0].strip())
+        title = sanitize_filename(clean_title(parts[1].strip()))
+        return artist, title
+    else:
+        return None, sanitize_filename(clean_title(full_title))
 
-    base = [
-        "yt-dlp",
-        "--no-continue",
-        "--no-part",
-        "--no-mtime",
-        "--ignore-errors",
-        "--skip-unavailable-fragments",
-        "--add-metadata",
-        "--embed-thumbnail",
-        "--restrict-filenames",
-        "--concurrent-fragments", "1",
-        "-x", "--audio-format", "mp3",
-        "-f", "bestaudio/best",
-        "-o", f"{out_dir}/%(playlist_title,playlist)s/%(playlist_index,02d)s-%(title).200B.%(ext)s",
-    ]
-
-    if os.path.exists(COOKIES):
-        base += ["--cookies", COOKIES]
-
-    if no_playlist:
-        base.append("--no-playlist")
-
-    clients = ["ios", "web_creator", "tv_embedded", "web"]
-
-    last_log = ""
-    for c in clients:
-        cmd = base + ["--extractor-args", f"youtube:player_client={c}", url]
-        rc, log = run_cmd(cmd, log_fp)
-        last_log = log
-
-        # Heuristika uspeha:
-        #  - rc == 0 i pojavljuje se Destination/Merging/Deleting original file u logu
-        #  - ili log govori da je fajl već skinut
-        if rc == 0 and any(token in log for token in ("Destination:", "Merging formats", "Deleting original file")):
-            return 0, log
-        if any(token in log for token in ("has already been downloaded", "100% of")):
-            return 0, log
-
-        # Ako je SABR 'images only' ili 'requested not available', probaj sledeći klijent
-        if ("Only images are available" in log) or ("Requested format is not available" in log):
-            log_fp.write(f"[info] Fallback: trying next client after '{c}'\n")
-            log_fp.flush()
-            continue
-
-        # Ako nije eksplicitno SABR, ali rc != 0, svejedno pokušaj sledeći
-        log_fp.write(f"[warn] Non-zero exit with client '{c}', trying next…\n")
-        log_fp.flush()
-
-    return 1, last_log
-
-def safe_tail(path: str, max_bytes: int = 32_768) -> str:
-    """Vrati poslednjih max_bytes iz fajla (za status)."""
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            start = max(0, size - max_bytes)
-            f.seek(start)
-            chunk = f.read().decode(errors="replace")
-            if start > 0:
-                return "...\n" + chunk
-            return chunk
-    except FileNotFoundError:
-        return ""
-
-def format_bytes(n: int) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if n < 1024.0:
-            return f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} PB"
-
-def list_mp3_files(root: str) -> List[Dict[str, str]]:
-    out = []
-    for base, _, files in os.walk(root):
-        for fn in files:
-            if fn.lower().endswith(".mp3"):
-                full = os.path.join(base, fn)
-                rel = os.path.relpath(full, root).replace("\\", "/")
+def post_process_filenames(target_folder: str, log):
+    for filename in os.listdir(target_folder):
+        if filename.lower().endswith(".mp3"):
+            full_path = os.path.join(target_folder, filename)
+            name_part = os.path.splitext(filename)[0]
+            artist, title = parse_artist_and_title(name_part)
+            new_name = f"{artist} - {title}.mp3" if artist else f"{title}.mp3"
+            new_path = os.path.join(target_folder, new_name)
+            if os.path.exists(new_path) and new_path != full_path:
+                log(f"⚠️ Duplikat: {new_name} već postoji. Brišem {filename}")
                 try:
-                    size = os.path.getsize(full)
-                except OSError:
-                    size = 0
-                out.append({"path": rel, "size": format_bytes(size)})
-    out.sort(key=lambda x: x["path"])
-    return out
+                    os.remove(full_path)
+                except Exception as e:
+                    log(f"⚠️ Ne mogu da obrišem {filename}: {e}")
+                continue
+            if new_path != full_path:
+                try:
+                    os.rename(full_path, new_path)
+                    log(f"✅ Preimenovano: {filename} -> {new_name}")
+                except Exception as e:
+                    log(f"⚠️ Nije moguće preimenovati {filename}: {e}")
 
-# === Worker koji izvršava download job ===
-def worker(job_id: str) -> None:
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job:
+# ================== yt-dlp logger ==================
+class YDLLogger:
+    def __init__(self, logfn):
+        self.log = logfn
+    def debug(self, msg):
+        if any(k in msg for k in ("Downloading", "Destination", "has already been downloaded", "Extracting", "Merging formats", "Deleting original file")):
+            self.log(msg)
+    def warning(self, msg):
+        self.log(f"⚠️ {msg}")
+    def error(self, msg):
+        self.log(f"❌ {msg}")
+
+# ================== CORE JOB (SABR fallback) ==================
+def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred_quality: str = "192"):
+    job = jobs[job_id]
+
+    def log(msg: str):
+        job["log"].append(msg)
+        print(f"[{job_id}] {msg}")
+
+    job["status"] = "running"
+    safe_subdir = sanitize_filename(target_subdir) or "yt-dlp-downloads"
+    target_folder = os.path.join(DOWNLOAD_ROOT, safe_subdir)
+    os.makedirs(target_folder, exist_ok=True)
+    job["target_folder"] = target_folder
+
+    failed_log_path = os.path.join(target_folder, LOG_FILE_NAME)
+    job["failed_log_path"] = failed_log_path
+    if os.path.exists(failed_log_path):
+        try:
+            os.remove(failed_log_path)
+        except Exception:
+            pass
+
+    def log_failed(url, reason):
+        try:
+            with open(failed_log_path, "a", encoding="utf-8") as f:
+                f.write(f"{url} - {reason}\n")
+        except Exception as e:
+            log(f"⚠️ Ne mogu da upišem u {LOG_FILE_NAME}: {e}")
+
+    last_file = {"name": None}
+
+    def hook(d):
+        try:
+            if d["status"] == "downloading" and d.get("filename"):
+                title = os.path.basename(d["filename"])
+                if title != last_file["name"]:
+                    last_file["name"] = title
+                    log(f"▶️ Skidam: {title}")
+            elif d["status"] == "finished" and d.get("filename"):
+                title = os.path.basename(d["filename"])
+                log(f"✅ Skinuto: {title}")
+                last_file["name"] = None
+        except Exception:
+            pass
+
+    def pp_hook(d):
+        if d.get("status") == "finished" and d.get("postprocessor") == "FFmpegExtractAudio":
+            try:
+                src = os.path.basename(d.get("info_dict", {}).get("_filename", ""))  # m4a/webm
+                base = os.path.splitext(src)[0] + ".mp3"
+                log(f"🎧 Konvertovano: {base}")
+            except Exception:
+                log("🎧 Konverzija završena.")
+
+    # Preflight: obavezan ffmpeg
+    if not shutil.which("ffmpeg"):
+        log("❌ FFmpeg nije instaliran. Instaliraj ffmpeg (dnf/apt/apk) i probaj ponovo.")
+        job["status"] = "error"
         return
 
-    url = job["url"]
-    no_playlist = job["no_playlist"]
-    out_dir = job["out_dir"]
-    log_path = job["log_path"]
+    # Bazne yt-dlp opcije (bez player_client — njega menjamo po pokušajima)
+    base_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(target_folder, "%(title)s.%(ext)s"),
+        "restrictfilenames": False,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": preferred_quality}
+        ],
+        "keepvideo": True,
+        "ignoreerrors": True,              # nastavi i kad neki item padne
+        "noplaylist": False,               # dozvoli playlist-e
+        "logger": YDLLogger(log),
+        "progress_hooks": [hook],
+        "postprocessor_hooks": [pp_hook],
+        # pragmatično: sporiji ali otporniji na greške
+        "concurrent_fragment_downloads": 1,
+    }
 
-    ensure_dir(os.path.dirname(log_path))
+    # Cookie podrška – poželjna za "Sign in to confirm you're not a bot"
+    if os.path.exists(COOKIE_FILE):
+        base_opts["cookiefile"] = COOKIE_FILE
+        log(f"🍪 Koristim cookiefile: {COOKIE_FILE}")
+    else:
+        log(f"⚠️ Cookie fajl nije pronađen: {COOKIE_FILE}. Za neke linkove biće potreban.")
 
-    with open(log_path, "a", encoding="utf-8") as log_fp:
-        log_fp.write(f"Spreman.\nPokrenut job: {job_id}\n")
-        log_fp.write(f"🍪 Cookiefile: {COOKIES if os.path.exists(COOKIES) else '(nema, nastavljam bez cookies)'}\n")
-        log_fp.write(f"🎵 URL: {url}\n")
-        log_fp.flush()
+    # SABR fallback redosled
+    clients_order = ["ios", "web_creator", "tv_embedded", "web"]
 
-        rc, _ = ytdlp_download(url=url, out_dir=out_dir, no_playlist=no_playlist, log_fp=log_fp)
+    # Heuristike grešaka koje znače “probaj sledećeg klijenta”
+    def is_sabr_block(err_text: str) -> bool:
+        et = err_text or ""
+        keys = [
+            "Only images are available",
+            "Requested format is not available",
+            "are missing a url",           # “some formats ... are missing a url”
+            "SABR",                        # ako yt-dlp eksplicitno napomene
+        ]
+        return any(k.lower() in et.lower() for k in keys)
 
-        with jobs_lock:
-            job = jobs.get(job_id)
-            if job:
-                job["status"] = "done" if rc == 0 else "error"
-                job["finished_at"] = dt.datetime.utcnow().isoformat() + "Z"
+    try:
+        for url in playlist_urls:
+            log(f"🎵 Pokrećem preuzimanje: {url}")
+            success = False
+            last_err = None
 
-# === Routes ===
-@app.get("/healthz")
-def healthz():
-    return "ok", 200
+            for client in clients_order:
+                opts = dict(base_opts)
+                opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+                log(f"➡️ Pokušaj sa klijentom: {client}")
 
-@app.get("/")
+                try:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        ydl.download([url])
+                    # Ako nije bačeno izuzetkom, proverićemo da li ima bar neki .mp3 fajl novijeg vremena
+                    success = True
+                    log(f"✅ Klijent '{client}' uspeo.")
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    log(f"⚠️ Klijent '{client}' nije uspeo: {last_err}")
+                    if is_sabr_block(last_err):
+                        log("ℹ️ Detektovan SABR blok na ovom klijentu — prebacujem na sledeći.")
+                        continue
+                    else:
+                        # druga vrsta greške – probaj sledećeg klijenta, ali zabeleži
+                        continue
+
+            if not success:
+                log(f"❌ Greška: {url} ({last_err or 'nepoznata greška'})")
+                log_failed(url, last_err or "nepoznata greška")
+
+        log("🔧 Obrada fajlova...")
+        post_process_filenames(target_folder, log)
+
+        # Skupljanje fajlova za ZIP
+        files_to_zip = []
+        for root, _, files in os.walk(target_folder):
+            for f in files:
+                if f.lower().endswith((".mp3", ".m4a", ".webm")):
+                    files_to_zip.append(os.path.join(root, f))
+
+        if not files_to_zip:
+            log("❌ Nema generisanih audio fajlova (.mp3/.m4a/.webm). Proveri linkove i/ili ffmpeg/cookies.")
+            job["status"] = "error"
+            return
+
+        # ZIP u PUBLIC_DOWNLOADS
+        zip_name = f"{safe_subdir}.zip"
+        tmp_zip_path = os.path.join(target_folder, zip_name)
+        try:
+            with zipfile.ZipFile(tmp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for full in files_to_zip:
+                    arc = os.path.relpath(full, start=target_folder)
+                    zf.write(full, arcname=arc)
+        except Exception as e:
+            log(f"⚠️ Neuspešno pakovanje ZIP-a: {e}")
+            job["status"] = "error"
+            return
+
+        final_zip_path = os.path.join(PUBLIC_DOWNLOADS, zip_name)
+        try:
+            os.replace(tmp_zip_path, final_zip_path)
+        except OSError:
+            try:
+                shutil.copy2(tmp_zip_path, final_zip_path)
+                os.remove(tmp_zip_path)
+            except Exception as e:
+                log(f"⚠️ Ne mogu da kopiram ZIP u public: {e}")
+                job["status"] = "error"
+                return
+
+        public_link = f"/ytpldl/downloads/{quote(zip_name)}"
+        job["public_zip"] = public_link
+        log(f"📦 ZIP spreman: {public_link}")
+
+        log("✅ Gotovo.")
+        job["status"] = "done"
+    except Exception as e:
+        log(f"💥 Fatal error: {e}")
+        traceback.print_exc()
+        job["status"] = "error"
+
+# ================== ROUTES ==================
+@app.route("/")
 def index():
-    # Minimal UI – submit forma i lista fajlova
-    files = list_mp3_files(PUBLIC_DOWNLOADS)
-    rows = "\n".join(
-        f"<tr><td><a href='/public/{html.escape(f['path'])}' target='_blank'>{html.escape(f['path'])}</a></td><td>{html.escape(f['size'])}</td></tr>"
-        for f in files
-    )
-    return Response(
-        f"""<!doctype html>
-<html lang="sr">
-<head><meta charset="utf-8"><title>ytpldl</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body{{font-family:system-ui,Arial,sans-serif;margin:24px;}}
-input[type=text]{{width:100%;padding:10px;border:1px solid #ccc;border-radius:10px}}
-button{{padding:10px 16px;border:1px solid #ccc;border-radius:10px;background:#f5f5f5;cursor:pointer}}
-table{{width:100%;border-collapse:collapse;margin-top:20px}}
-td,th{{padding:8px;border-bottom:1px solid #eee;text-align:left}}
-.small{{color:#666;font-size:.9rem}}
-.card{{border:1px solid #eee;border-radius:16px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
-</style>
-</head>
-<body>
-  <h1>YT Playlist → MP3 (SABR-ready)</h1>
-  <div class="card">
-    <form method="post" action="/api/download">
-      <label> YouTube URL:</label><br/>
-      <input type="text" name="url" placeholder="https://www.youtube.com/watch?v=..." required>
-      <p><label><input type="checkbox" name="no_playlist" value="1"> Skini samo ovaj video (ne celu playlistu)</label></p>
-      <button type="submit">Pokreni preuzimanje</button>
-    </form>
-    <p class="small">Fajlovi idu u <code>{html.escape(PUBLIC_DOWNLOADS)}</code>. Ako URL sadrži i <code>list=</code>, po difoltu se skida cela plejlista.</p>
-  </div>
-
-  <h2>Preuzeti fajlovi</h2>
-  <table>
-    <thead><tr><th>Fajl</th><th>Veličina</th></tr></thead>
-    <tbody>{rows or "<tr><td colspan='2' class='small'>Nema fajlova još.</td></tr>"}</tbody>
-  </table>
-</body>
-</html>""",
-        mimetype="text/html",
-    )
-
-@app.post("/api/download")
-def api_download():
-    url = request.form.get("url") or (request.json or {}).get("url")
-    if not url:
-        return jsonify({"error": "Nedostaje 'url'"}), 400
-
-    no_playlist = False
-    if request.is_json:
-        no_playlist = bool((request.json or {}).get("no_playlist"))
-    else:
-        no_playlist = request.form.get("no_playlist") == "1"
-
-    job_id = uuid4().hex[:8]
-    out_dir = os.path.join(PUBLIC_DOWNLOADS, "yt")
-    logs_dir = os.path.join(PUBLIC_DOWNLOADS, "jobs")
-    ensure_dir(out_dir)
-    ensure_dir(logs_dir)
-    log_path = os.path.join(logs_dir, f"{job_id}.log")
-
-    with jobs_lock:
-        jobs[job_id] = {
-            "job_id": job_id,
-            "url": url,
-            "no_playlist": no_playlist,
-            "status": "running",
-            "started_at": dt.datetime.utcnow().isoformat() + "Z",
-            "finished_at": None,
-            "out_dir": out_dir,
-            "log_path": log_path,
+    html = """<!doctype html>
+    <meta charset="utf-8" />
+    <title>YTPLDL</title>
+    <style>
+      body{font-family:system-ui,Arial,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem}
+      input,textarea,button{width:100%;padding:.6rem;border:1px solid #ccc;border-radius:10px}
+      button{cursor:pointer;margin-top:.5rem}
+      #log{white-space:pre-wrap;background:#0a0a0a;color:#eaeaea;padding:1rem;
+           border-radius:10px;height:300px;overflow-y:auto;font-size:15px;}
+      .muted{color:#666}
+      a.btn{display:inline-block;margin-top:.5rem;font-weight:600}
+    </style>
+    <h1>YouTube Play List Downloader</h1>
+    <p class="muted">⚠️ Poštuj autorska prava i uslove korišćenja YouTube-a.</p>
+    <label>Playlist ili video URL-ovi (jedan po liniji)</label>
+    <textarea id="urls" rows="6"
+      placeholder="https://www.youtube.com/playlist?list=...&#10;https://www.youtube.com/watch?v=..."></textarea>
+    <label>Upiši naziv playliste/ZIP-a</label>
+    <input id="folder" value=""/>
+    <label>MP3 kvalitet (kbps: 128/192/256/320)</label>
+    <input id="quality" value="192"/>
+    <button id="startBtn">Pokreni</button>
+    <div id="log">Spreman.</div>
+    <script>
+      const logBox = document.getElementById('log');
+      const basePath = window.location.pathname.replace(/\\/$/, '');
+      let currentJob = null;
+      let lastLines = 0;
+      let pollTimer = null;
+      function appendLog(t){
+        logBox.textContent += "\\n" + t;
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+      document.getElementById('startBtn').addEventListener('click', async ()=>{
+        const urls = document.getElementById('urls').value.split('\\n').map(s=>s.trim()).filter(Boolean);
+        const folder = document.getElementById('folder').value.trim() || 'yt-dlp-downloads';
+        const quality = document.getElementById('quality').value.trim() || '192';
+        const res = await fetch(`${basePath}/start`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({urls,folder,quality})
+        });
+        const data = await res.json();
+        if(data.error){
+          appendLog('❌ ' + data.error);
+          return;
         }
+        currentJob = data.job_id;
+        appendLog(`Pokrenut job: ${currentJob}`);
+        startPolling();
+      });
+      function startPolling(){
+        if(pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(async ()=>{
+          if(!currentJob) return;
+          const res = await fetch(`${basePath}/logs/${currentJob}`);
+          if(!res.ok) return;
+          const data = await res.json();
+          const newLines = data.log.slice(lastLines);
+          newLines.forEach(line=>appendLog(line));
+          lastLines = data.log.length;
+          if(data.status==='done'||data.status==='error'){
+            clearInterval(pollTimer);
+            appendLog(`\\nStatus: ${data.status}`);
+            if(data.public_zip){
+              appendLog(`\\nZIP: ${data.public_zip}`);
+              const a=document.createElement('a');
+              a.href=data.public_zip;
+              a.textContent='⬇️ Preuzmi ZIP';
+              a.className='btn';
+              a.download = '';
+              logBox.insertAdjacentElement('afterend',a);
+            }
+          }
+        },1000);
+      }
+    </script>"""
+    return Response(html, mimetype="text/html")
 
-    t = threading.Thread(target=worker, args=(job_id,), daemon=True)
+@app.route("/start", methods=["POST"])
+def start_job():
+    data = request.get_json(force=True)
+    urls = data.get("urls") or []
+    folder = data.get("folder") or "yt-dlp-downloads"
+    quality = str(data.get("quality") or "192")
+
+    if not isinstance(urls, list) or not urls:
+        return jsonify({"error": "Prosledi makar jedan URL."}), 400
+
+    job_id = uuid.uuid4().hex[:8]
+    jobs[job_id] = {"status": "queued", "log": deque(maxlen=8000), "public_zip": None}
+    t = threading.Thread(target=run_job, args=(job_id, urls, folder, quality), daemon=True)
     t.start()
+    return jsonify({"job_id": job_id})
 
-    # Ako je forma, redirectuj na status; ako je JSON, vrati payload
-    if request.content_type and request.content_type.startswith("application/json"):
-        return jsonify({"job_id": job_id, "status_url": f"/api/status/{job_id}"})
-    else:
-        return Response(
-            f"""<!doctype html><meta charset="utf-8">
-<p>Pokrenut job: <b>{job_id}</b></p>
-<p>Prati status: <a href="/api/status/{job_id}" target="_blank">/api/status/{job_id}</a></p>
-<p><a href="/">← Nazad</a></p>""",
-            mimetype="text/html",
-        )
-
-@app.get("/api/status/<job_id>")
-def api_status(job_id: str):
-    with jobs_lock:
-        job = jobs.get(job_id)
+@app.route("/logs/<job_id>")
+def get_logs(job_id):
+    job = jobs.get(job_id)
     if not job:
-        # Ako nema u memoriji, pokušaj bar log fajl da prikažeš
-        log_path = os.path.join(PUBLIC_DOWNLOADS, "jobs", f"{job_id}.log")
-        tail = safe_tail(log_path)
-        return jsonify({"job_id": job_id, "status": "unknown", "tail": tail})
+        return jsonify({"error": "Nepoznat job."}), 404
+    return jsonify({"status": job["status"], "log": list(job["log"]), "public_zip": job.get("public_zip")})
 
-    tail = safe_tail(job["log_path"])
-    return jsonify({
-        "job_id": job_id,
-        "status": job["status"],
-        "started_at": job["started_at"],
-        "finished_at": job["finished_at"],
-        "log_path": job["log_path"].replace("\\", "/"),
-        "tail": tail,
-    })
+@app.route("/ytpldl/downloads/<path:filename>")
+def download_file(filename):
+    return send_from_directory(PUBLIC_DOWNLOADS, filename, as_attachment=True)
 
-@app.get("/downloads/")
-def list_downloads():
-    files = list_mp3_files(PUBLIC_DOWNLOADS)
-    return jsonify({"root": PUBLIC_DOWNLOADS, "files": files})
+@app.errorhandler(Exception)
+def handle_all_errors(e):
+    trace = traceback.format_exc()
+    print("=== INTERNAL ERROR ===")
+    print(trace)
+    return jsonify({"error": str(e), "type": e.__class__.__name__}), 500
 
-@app.get("/public/<path:filename>")
-def public_file(filename: str):
-    # Služi statičke fajlove iz PUBLIC_DOWNLOADS (MP3, logovi, itd.)
-    return send_from_directory(PUBLIC_DOWNLOADS, filename, as_attachment=False)
-
-# === Local dev ===
 if __name__ == "__main__":
-    ensure_dir(PUBLIC_DOWNLOADS)
     app.run(host="0.0.0.0", port=8000, debug=True)
