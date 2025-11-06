@@ -34,4 +34,5 @@ EXPOSE 8000
 # HEALTHCHECK --interval=30s --timeout=3s --retries=5 CMD wget -qO- http://127.0.0.1:8000/healthz || exit 1
 
 # Production entry - gunicorn
-CMD ["gunicorn", "--workers", "4", "--threads", "4", "--bind", "0.0.0.0:8000", "app:app"]
+CMD ["python", "-m", "gunicorn", "--workers", "4", "--threads", "4", "--bind", "0.0.0.0:8000", "app:app"]
+
