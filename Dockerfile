@@ -1,11 +1,13 @@
-# Dockerfile - Python base from AWS public ECR + ffmpeg + gunicorn
+# Dockerfile - Python base from AWS public ECR + ffmpeg + gunicorn + cookies
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    # defaulti (biće prepisani iz docker-compose.yml okolinom)
+    # defaulti (možeš ih prepisati u compose-u)
     DOWNLOAD_ROOT=/data/ytpldl/work \
-    PUBLIC_DOWNLOADS=/app/public/downloads
+    PUBLIC_DOWNLOADS=/app/public/downloads \
+    # putanja do cookies fajla unutar containera
+    YTDLP_COOKIEFILE=/app/cookies.txt
 
 # OS deps + ffmpeg (yt-dlp koristi ffmpeg/ffprobe)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -17,18 +19,19 @@ WORKDIR /app
 # Brži/otporniji pip
 RUN python -m pip install --upgrade pip
 
-# Zavisnosti
+# Zavisnosti (u requirements.txt OBAVEZNO: Flask, yt-dlp, gunicorn)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Aplikacija
+# Aplikacija + cookies
+# (cookies.txt mora biti u root-u projekta pored app.py pre build-a)
 COPY . .
+# opciono: setuj permisije (ne mora, ali je uredno)
+RUN chmod 600 /app/cookies.txt || true
 
-# Ne definisemo VOLUME ovde; koristiš host bind mountove u compose-u
+# Ne definišemo VOLUME ovde; koristi se bind mount u compose-u po potrebi
+RUN mkdir -p /app/public/downloads /data/ytpldl/work
 EXPOSE 8000
-
-# (opciono) HEALTHCHECK – ako dodaš /health u app.py
-# HEALTHCHECK --interval=30s --timeout=5s --retries=10 CMD wget -qO- http://127.0.0.1:8000/health || exit 1
 
 # Production entry - gunicorn (duži timeout jer se preuzimaju plejliste/zip)
 CMD ["python", "-m", "gunicorn", \
