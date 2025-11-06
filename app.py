@@ -16,6 +16,9 @@ os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
 PUBLIC_DOWNLOADS = os.environ.get("PUBLIC_DOWNLOADS", "/app/public/downloads")
 os.makedirs(PUBLIC_DOWNLOADS, exist_ok=True)
 
+# Putanja do cookies fajla unutar containera (može i preko ENV)
+COOKIE_FILE = os.environ.get("YTDLP_COOKIEFILE", "/app/cookies.txt")
+
 LOG_FILE_NAME = "failed_downloads.txt"
 jobs = {}
 
@@ -70,7 +73,6 @@ class YDLLogger:
     def __init__(self, logfn): 
         self.log = logfn
     def debug(self, msg):
-        # yt-dlp šalje dosta info kroz debug; prikažemo korisne
         if any(k in msg for k in ("Downloading", "Destination", "has already been downloaded", "Extracting")):
             self.log(msg)
     def warning(self, msg): 
@@ -124,10 +126,9 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
             pass
 
     def pp_hook(d):
-        # Precizan log kad FFmpegExtractAudio završi
         if d.get("status") == "finished" and d.get("postprocessor") == "FFmpegExtractAudio":
             try:
-                src = os.path.basename(d.get("info_dict", {}).get("_filename", ""))  # originalni fajl (m4a/webm)
+                src = os.path.basename(d.get("info_dict", {}).get("_filename", ""))  # m4a/webm
                 base = os.path.splitext(src)[0] + ".mp3"
                 log(f"🎧 Konvertovano: {base}")
             except Exception:
@@ -147,18 +148,22 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": preferred_quality}
         ],
-        "keepvideo": True,        # zadrži m4a/webm u slučaju da konverzija padne (imaćemo bar nešto)
-        "ignoreerrors": False,    # NE ignorišemo greške, želimo ih u logu
+        "keepvideo": True,
+        "ignoreerrors": False,
         "noplaylist": False,
         "logger": YDLLogger(log),
         "progress_hooks": [hook],
         "postprocessor_hooks": [pp_hook],
-        # Po želji: stabilniji mix klijenata (nekad pomaže kod restrikcija)
-        # "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        # Ako ti trebaju kolačići (age-restricted/privatne liste), uključi jedan od ova dva pristupa:
-        # "cookiesfrombrowser": ("chrome",),  # ili ("edge",) / ("firefox",)
-        # "cookiefile": "/path/to/cookies.txt",
+        # stabilizacija može pomoći, ali cookies su ključni za "sign in" blok
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
+
+    # Cookie podrška – zahtevana za "Sign in to confirm you're not a bot"
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts["cookiefile"] = COOKIE_FILE
+        log(f"🍪 Koristim cookiefile: {COOKIE_FILE}")
+    else:
+        log(f"⚠️ Cookie fajl nije pronađen: {COOKIE_FILE}. Za neke linkove biće potreban.")
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -173,20 +178,19 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         log("🔧 Obrada fajlova...")
         post_process_filenames(target_folder, log)
 
-        # === Skupljanje fajlova za ZIP (preferiramo .mp3, ali fallback na .m4a/.webm) ===
+        # Skupljanje fajlova za ZIP
         files_to_zip = []
         for root, _, files in os.walk(target_folder):
             for f in files:
                 if f.lower().endswith((".mp3", ".m4a", ".webm")):
-                    full = os.path.join(root, f)
-                    files_to_zip.append(full)
+                    files_to_zip.append(os.path.join(root, f))
 
         if not files_to_zip:
             log("❌ Nema generisanih audio fajlova (.mp3/.m4a/.webm). Proveri linkove i/ili ffmpeg/cookies.")
             job["status"] = "error"
             return
 
-        # === ZIP u PUBLIC_DOWNLOADS ===
+        # ZIP u PUBLIC_DOWNLOADS
         zip_name = f"{safe_subdir}.zip"
         tmp_zip_path = os.path.join(target_folder, zip_name)
         try:
@@ -211,7 +215,6 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
                 job["status"] = "error"
                 return
 
-        # Link ka ruti koja servira public downloads (radi i bez Nginx-a)
         public_link = f"/ytpldl/downloads/{quote(zip_name)}"
         job["public_zip"] = public_link
         log(f"📦 ZIP spreman: {public_link}")
@@ -328,10 +331,8 @@ def get_logs(job_id):
         return jsonify({"error": "Nepoznat job."}), 404
     return jsonify({"status": job["status"], "log": list(job["log"]), "public_zip": job.get("public_zip")})
 
-# Serviranje ZIP-ova iz PUBLIC_DOWNLOADS (radi i bez Nginx proxy-ja)
 @app.route("/ytpldl/downloads/<path:filename>")
 def download_file(filename):
-    # security: servira samo iz PUBLIC_DOWNLOADS
     return send_from_directory(PUBLIC_DOWNLOADS, filename, as_attachment=True)
 
 @app.errorhandler(Exception)
@@ -342,5 +343,4 @@ def handle_all_errors(e):
     return jsonify({"error": str(e), "type": e.__class__.__name__}), 500
 
 if __name__ == "__main__":
-    # Pokretanje
     app.run(host="0.0.0.0", port=8000, debug=True)
