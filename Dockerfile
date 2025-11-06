@@ -19,6 +19,9 @@ WORKDIR /app
 # Brži/otporniji pip
 RUN python -m pip install --upgrade pip
 
+# Odradi upgrade yt-dlp na najnoviju verziju
+RUN pip install --upgrade yt-dlp
+
 # Zavisnosti (u requirements.txt OBAVEZNO: Flask, yt-dlp, gunicorn)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -37,3 +40,4 @@ EXPOSE 8000
 CMD ["python", "-m", "gunicorn", \
      "--workers", "4", "--threads", "4", "--timeout", "3600", \
      "--bind", "0.0.0.0:8000", "app:app"]
+
