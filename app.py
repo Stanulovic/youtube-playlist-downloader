@@ -175,7 +175,7 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
 def index():
     html = """<!doctype html>
     <meta charset="utf-8" />
-    <title>yt-dlp Web UI</title>
+    <title>YTPLDL</title>
     <style>
       body{font-family:system-ui,Arial,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem}
       input,textarea,button{width:100%;padding:.6rem;border:1px solid #ccc;border-radius:10px}
@@ -185,13 +185,13 @@ def index():
       .muted{color:#666}
       a.btn{display:inline-block;margin-top:.5rem;font-weight:600}
     </style>
-    <h1>yt-dlp Web UI</h1>
+    <h1>YouTube Play List Downloader</h1>
     <p class="muted">⚠️ Poštuj autorska prava i uslove korišćenja YouTube-a.</p>
     <label>Playlist ili video URL-ovi (jedan po liniji)</label>
     <textarea id="urls" rows="6"
       placeholder="https://www.youtube.com/playlist?list=...&#10;https://www.youtube.com/watch?v=..."></textarea>
-    <label>Naziv foldera/ZIP-a</label>
-    <input id="folder" value="Play Lista 1"/>
+    <label>Upisi naizv playliste/ZIP-a</label>
+    <input id="folder" value=""/>
     <label>MP3 kvalitet (kbps: 128/192/256/320)</label>
     <input id="quality" value="192"/>
     <button id="startBtn">Pokreni</button>
@@ -283,3 +283,4 @@ def handle_all_errors(e):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
+
