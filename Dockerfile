@@ -2,12 +2,15 @@
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    # defaulti (biće prepisani iz docker-compose.yml okolinom)
+    DOWNLOAD_ROOT=/data/ytpldl/work \
+    PUBLIC_DOWNLOADS=/app/public/downloads
 
-# OS deps + ffmpeg (yt-dlp često treba ffmpeg)
+# OS deps + ffmpeg (yt-dlp koristi ffmpeg/ffprobe)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg ca-certificates build-essential \
- && rm -rf /var/lib/apt/lists/*
+      ffmpeg ca-certificates build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -21,18 +24,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Aplikacija
 COPY . .
 
-# Download direktorijum
-RUN mkdir -p /app/downloads && \
-    adduser --disabled-password --gecos "" appuser && \
-    chown -R appuser:appuser /app
-USER appuser
-
-VOLUME ["/app/downloads"]
+# Ne definisemo VOLUME ovde; koristiš host bind mountove u compose-u
 EXPOSE 8000
 
-# Po želji health endpoint u app-u: /healthz pa dodaš HEALTHCHECK
-# HEALTHCHECK --interval=30s --timeout=3s --retries=5 CMD wget -qO- http://127.0.0.1:8000/healthz || exit 1
+# (opciono) HEALTHCHECK – ako dodaš /health u app.py
+# HEALTHCHECK --interval=30s --timeout=5s --retries=10 CMD wget -qO- http://127.0.0.1:8000/health || exit 1
 
-# Production entry - gunicorn
-CMD ["python", "-m", "gunicorn", "--workers", "4", "--threads", "4", "--bind", "0.0.0.0:8000", "app:app"]
-
+# Production entry - gunicorn (duži timeout jer se preuzimaju plejliste/zip)
+CMD ["python", "-m", "gunicorn", \
+     "--workers", "4", "--threads", "4", "--timeout", "3600", \
+     "--bind", "0.0.0.0:8000", "app:app"]
