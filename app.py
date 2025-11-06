@@ -5,10 +5,12 @@ import glob
 import shutil
 import tempfile
 import threading
+import zipfile
 from collections import deque
-from flask import Flask, request, jsonify, Response, send_file, abort
+from flask import Flask, request, jsonify, Response, send_file, abort, after_this_request
 
 # ---------------- CONFIG ----------------
+# Snima u korisnikov sistemski "Downloads" folder (za batch mod na serveru)
 DOWNLOAD_ROOT = os.path.join(os.path.expanduser("~"), "Downloads")
 os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
 
@@ -143,30 +145,33 @@ def index():
     <meta charset="utf-8" />
     <title>yt-dlp Web UI</title>
     <style>
-      body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}
+      body{font-family:system-ui,Arial,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem}
       h1{margin-bottom:.5rem}
       input,textarea,button{width:100%;padding:.6rem;border:1px solid #ccc;border-radius:10px}
-      button{cursor:pointer;margin-top:1rem}
+      button{cursor:pointer;margin-top:.5rem}
       #log{white-space:pre-wrap;background:#0a0a0a;color:#eaeaea;padding:1rem;
            border-radius:10px;height:300px;overflow-y:auto;font-size:15px;}
       .muted{color:#666}
-      .row{display:grid;grid-template-columns:1fr auto;gap:.5rem;align-items:center}
+      .row{display:grid;grid-template-columns:1fr 1fr auto;gap:.5rem;align-items:center}
+      .note{font-size:14px;color:#777;margin:.25rem 0 1rem}
     </style>
     <h1>yt-dlp Web UI</h1>
     <p class="muted">⚠️ Poštuj autorska prava i uslove korišćenja YouTube-a.</p>
 
     <label>Playlist ili video URL-ovi (jedan po liniji)</label>
     <textarea id="urls" rows="6"
-      placeholder="https://www.youtube.com/watch?v=...&#10;https://www.youtube.com/playlist?list=..."></textarea>
+      placeholder="https://www.youtube.com/playlist?list=...&#10;https://www.youtube.com/watch?v=..."></textarea>
 
-    <label>Folder (biće kreiran u Downloads)</label>
-    <input id="folder" value="Play Lista 1"/>
+    <label>Ime ZIP fajla (bez .zip)</label>
+    <input id="zipname" value="playlist"/>
 
     <label>MP3 kvalitet (kbps: 128/192/256/320)</label>
     <div class="row">
       <input id="quality" value="192"/>
       <button id="directBtn" title="Preuzmi 1 URL direktno kao MP3 (na tvoj računar)">Preuzmi direktno (1 URL)</button>
+      <button id="zipBtn" title="Preuzmi ZIP svih MP3 (playlist)">Preuzmi ZIP (playlist)</button>
     </div>
+    <div class="note">• „Preuzmi direktno (1 URL)“ šalje jedan MP3 odmah u tvoj browser. • „Preuzmi ZIP (playlist)“ spakuje sve MP3 u jedan .zip i šalje na tvoj računar.</div>
 
     <button id="startBtn">Pokreni (batch/playlist na server)</button>
 
@@ -185,10 +190,10 @@ def index():
         logBox.scrollTop = logBox.scrollHeight;
       }
 
-      // Batch/playlist job (obrađuje na serveru)
+      // Batch/playlist job (radi na serveru)
       document.getElementById('startBtn').addEventListener('click', async ()=>{
         const urls = document.getElementById('urls').value.split('\\n').map(s=>s.trim()).filter(Boolean);
-        const folder = document.getElementById('folder').value.trim() || 'yt-dlp-downloads';
+        const folder = document.getElementById('zipname').value.trim() || 'yt-dlp-downloads';
         const quality = document.getElementById('quality').value.trim() || '192';
         const res = await fetch(`${basePath}/start`, {
           method:'POST',
@@ -202,7 +207,7 @@ def index():
         startPolling();
       });
 
-      // Direct download (1 URL) -> odmah snima na korisnikov računar
+      // Direct download (1 URL) -> odmah snima MP3 korisniku
       document.getElementById('directBtn').addEventListener('click', ()=>{
         const firstUrl = document.getElementById('urls').value.split('\\n').map(s=>s.trim()).filter(Boolean)[0];
         const quality = document.getElementById('quality').value.trim() || '192';
@@ -210,11 +215,27 @@ def index():
           appendLog("❌ Unesi makar jedan URL za direktno preuzimanje.");
           return;
         }
-        // Redirect na /direct?url=... da browser pokrene download
         const u = new URL(window.location.href);
         u.pathname = basePath + "/direct";
         u.searchParams.set("url", firstUrl);
         u.searchParams.set("quality", quality);
+        window.location.href = u.toString();
+      });
+
+      // Direct ZIP (playlist) -> spakuje sve u zip i snima korisniku
+      document.getElementById('zipBtn').addEventListener('click', ()=>{
+        const firstUrl = document.getElementById('urls').value.split('\\n').map(s=>s.trim()).filter(Boolean)[0];
+        const quality = document.getElementById('quality').value.trim() || '192';
+        const zipname = document.getElementById('zipname').value.trim() || 'playlist';
+        if(!firstUrl){
+          appendLog("❌ Unesi makar jedan playlist URL za ZIP.");
+          return;
+        }
+        const u = new URL(window.location.href);
+        u.pathname = basePath + "/direct_zip";
+        u.searchParams.set("url", firstUrl);
+        u.searchParams.set("quality", quality);
+        u.searchParams.set("name", zipname);
         window.location.href = u.toString();
       });
 
@@ -284,43 +305,103 @@ def direct_download():
         abort(400, "Parametar 'url' je obavezan")
 
     tmpdir = tempfile.mkdtemp(prefix="ytdlp_")
-    try:
-        # skidamo JEDAN URL i konvertujemo u mp3
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-            "restrictfilenames": False,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": preferred_quality,
-                }
-            ],
-            "ignoreerrors": False,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-        # pronalazimo generisani mp3
-        mp3_files = glob.glob(os.path.join(tmpdir, "*.mp3"))
-        if not mp3_files:
-            abort(500, "MP3 nije pronađen nakon konverzije.")
-
-        mp3_path = mp3_files[0]
-        filename = os.path.basename(mp3_path)
-        # šaljemo kao attachment (browser preuzima direktno na korisnikov računar)
-        return send_file(mp3_path, as_attachment=True, download_name=filename, mimetype="audio/mpeg")
-    finally:
-        # obriši privremeni dir i sve fajlove
+    @after_this_request
+    def cleanup(response):
         try:
             shutil.rmtree(tmpdir)
         except Exception:
             pass
+        return response
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+        "restrictfilenames": False,
+        "postprocessors": [{"key": "FFmpegExtractAudio","preferredcodec": "mp3","preferredquality": preferred_quality}],
+        "ignoreerrors": False,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    mp3_files = glob.glob(os.path.join(tmpdir, "*.mp3"))
+    if not mp3_files:
+        abort(500, "MP3 nije pronađen nakon konverzije.")
+
+    mp3_path = mp3_files[0]
+    filename = os.path.basename(mp3_path)
+    return send_file(mp3_path, as_attachment=True, download_name=filename, mimetype="audio/mpeg")
+
+
+@app.route("/direct_zip")
+def direct_zip():
+    """
+    Playlist (ili jedan URL) -> skida/konvertuje sve u privremeni folder -> pravi ZIP -> šalje korisniku.
+    Nakon slanja ZIP-a, ceo privremeni folder se briše.
+    """
+    url = request.args.get("url", "").strip()
+    preferred_quality = str(request.args.get("quality", "192")).strip() or "192"
+    zipname = sanitize_filename(request.args.get("name", "playlist").strip() or "playlist")
+    if not url:
+        abort(400, "Parametar 'url' je obavezan")
+
+    tmpdir = tempfile.mkdtemp(prefix="ytdlp_zip_")
+    zippath = os.path.join(tmpdir, f"{zipname}.zip")
+
+    @after_this_request
+    def cleanup(response):
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+        return response
+
+    # Skidanje cele playliste (noplaylist=False) i konverzija u mp3
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+        "restrictfilenames": False,
+        "postprocessors": [{"key": "FFmpegExtractAudio","preferredcodec": "mp3","preferredquality": preferred_quality}],
+        "ignoreerrors": True,
+        "noplaylist": False,  # važno: hoćemo celu playlistu
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    # Pronađi sve .mp3 i spakuj u zip
+    mp3_files = sorted(glob.glob(os.path.join(tmpdir, "*.mp3")))
+    if not mp3_files:
+        abort(500, "Nema MP3 fajlova nakon konverzije (playlist možda prazan ili greška u skidanju).")
+
+    # (opciono) preimenovanje u "Artist - Title.mp3"
+    for path in list(mp3_files):
+        fname = os.path.basename(path)
+        name_part = os.path.splitext(fname)[0]
+        artist, title = parse_artist_and_title(name_part)
+        new_name = f"{artist} - {title}.mp3" if artist else f"{title}.mp3"
+        new_path = os.path.join(tmpdir, new_name)
+        if new_path != path:
+            try:
+                if os.path.exists(new_path):
+                    os.remove(path)
+                else:
+                    os.rename(path, new_path)
+            except Exception:
+                pass
+    # osveži listu nakon rename-a
+    mp3_files = sorted(glob.glob(os.path.join(tmpdir, "*.mp3")))
+
+    with zipfile.ZipFile(zippath, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for mp3 in mp3_files:
+            zf.write(mp3, arcname=os.path.basename(mp3))
+
+    return send_file(zippath, as_attachment=True, download_name=os.path.basename(zippath), mimetype="application/zip")
 
 
 if __name__ == "__main__":
