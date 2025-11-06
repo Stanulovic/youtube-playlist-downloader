@@ -1,12 +1,14 @@
 import os
 import re
 import uuid
+import glob
+import shutil
+import tempfile
 import threading
 from collections import deque
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_file, abort
 
 # ---------------- CONFIG ----------------
-# Snima u korisnikov sistemski "Downloads" folder
 DOWNLOAD_ROOT = os.path.join(os.path.expanduser("~"), "Downloads")
 os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
 
@@ -110,7 +112,6 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         ],
         "ignoreerrors": True,
         "noplaylist": False,
-        # ffmpeg je u PATH (Docker/OS), zato ne navodimo 'ffmpeg_location'
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [hook],
@@ -149,6 +150,7 @@ def index():
       #log{white-space:pre-wrap;background:#0a0a0a;color:#eaeaea;padding:1rem;
            border-radius:10px;height:300px;overflow-y:auto;font-size:15px;}
       .muted{color:#666}
+      .row{display:grid;grid-template-columns:1fr auto;gap:.5rem;align-items:center}
     </style>
     <h1>yt-dlp Web UI</h1>
     <p class="muted">⚠️ Poštuj autorska prava i uslove korišćenja YouTube-a.</p>
@@ -161,19 +163,19 @@ def index():
     <input id="folder" value="Play Lista 1"/>
 
     <label>MP3 kvalitet (kbps: 128/192/256/320)</label>
-    <input id="quality" value="192"/>
+    <div class="row">
+      <input id="quality" value="192"/>
+      <button id="directBtn" title="Preuzmi 1 URL direktno kao MP3 (na tvoj računar)">Preuzmi direktno (1 URL)</button>
+    </div>
 
-    <button id="startBtn">Pokreni</button>
+    <button id="startBtn">Pokreni (batch/playlist na server)</button>
 
     <h2>Log</h2>
     <div id="log">Spreman.</div>
 
     <script>
       const logBox = document.getElementById('log');
-
-      // baza = trenutna putanja (npr. /ytpldl), bez završne kose crte
       const basePath = window.location.pathname.replace(/\\/$/, '');
-
       let currentJob = null;
       let lastLines = 0;
       let pollTimer = null;
@@ -183,21 +185,37 @@ def index():
         logBox.scrollTop = logBox.scrollHeight;
       }
 
+      // Batch/playlist job (obrađuje na serveru)
       document.getElementById('startBtn').addEventListener('click', async ()=>{
         const urls = document.getElementById('urls').value.split('\\n').map(s=>s.trim()).filter(Boolean);
         const folder = document.getElementById('folder').value.trim() || 'yt-dlp-downloads';
         const quality = document.getElementById('quality').value.trim() || '192';
-
         const res = await fetch(`${basePath}/start`, {
           method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({urls,folder,quality})
         });
-
         const data = await res.json();
+        if(data.error){ appendLog("❌ " + data.error); return; }
         currentJob = data.job_id;
         appendLog(`Pokrenut job: ${currentJob}`);
         startPolling();
+      });
+
+      // Direct download (1 URL) -> odmah snima na korisnikov računar
+      document.getElementById('directBtn').addEventListener('click', ()=>{
+        const firstUrl = document.getElementById('urls').value.split('\\n').map(s=>s.trim()).filter(Boolean)[0];
+        const quality = document.getElementById('quality').value.trim() || '192';
+        if(!firstUrl){
+          appendLog("❌ Unesi makar jedan URL za direktno preuzimanje.");
+          return;
+        }
+        // Redirect na /direct?url=... da browser pokrene download
+        const u = new URL(window.location.href);
+        u.pathname = basePath + "/direct";
+        u.searchParams.set("url", firstUrl);
+        u.searchParams.set("quality", quality);
+        window.location.href = u.toString();
       });
 
       function startPolling(){
@@ -254,6 +272,57 @@ def get_logs(job_id):
     })
 
 
+@app.route("/direct")
+def direct_download():
+    """
+    Jedan URL -> server konvertuje u MP3 i ODMAH šalje korisniku kao download.
+    Ne ostavlja trajne fajlove na serveru (samo privremeni dir koji brišemo).
+    """
+    url = request.args.get("url", "").strip()
+    preferred_quality = str(request.args.get("quality", "192")).strip() or "192"
+    if not url:
+        abort(400, "Parametar 'url' je obavezan")
+
+    tmpdir = tempfile.mkdtemp(prefix="ytdlp_")
+    try:
+        # skidamo JEDAN URL i konvertujemo u mp3
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+            "restrictfilenames": False,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": preferred_quality,
+                }
+            ],
+            "ignoreerrors": False,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        # pronalazimo generisani mp3
+        mp3_files = glob.glob(os.path.join(tmpdir, "*.mp3"))
+        if not mp3_files:
+            abort(500, "MP3 nije pronađen nakon konverzije.")
+
+        mp3_path = mp3_files[0]
+        filename = os.path.basename(mp3_path)
+        # šaljemo kao attachment (browser preuzima direktno na korisnikov računar)
+        return send_file(mp3_path, as_attachment=True, download_name=filename, mimetype="audio/mpeg")
+    finally:
+        # obriši privremeni dir i sve fajlove
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
-    # Za lokalni rad; u produkciji koristi Gunicorn iza Nginx-a
+    # lokalno (za docker produkciju koristi Gunicorn na :8000)
     app.run(host="0.0.0.0", port=8000, debug=True)
