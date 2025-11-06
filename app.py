@@ -6,6 +6,7 @@ from collections import deque
 from flask import Flask, request, jsonify, Response
 
 # ---------------- CONFIG ----------------
+# Snima u korisnikov sistemski "Downloads" folder
 DOWNLOAD_ROOT = os.path.join(os.path.expanduser("~"), "Downloads")
 os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
 
@@ -80,7 +81,7 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         with open(failed_log_path, "a", encoding="utf-8") as f:
             f.write(f"{url} - {reason}\n")
 
-    # 🔧 pamti koji fajl se trenutno skida da ne spama
+    # pamti koji fajl se trenutno skida da ne spama
     last_file = {"name": None}
 
     def hook(d):
@@ -92,9 +93,8 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         elif d["status"] == "finished" and d.get("filename"):
             title = os.path.basename(d["filename"])
             log(f"✅ Skinuto: {title}")
-            # odmah proveravamo konverziju
-            mp3_path = os.path.splitext(title)[0] + ".mp3"
-            log(f"🎧 Konvertujem u {mp3_path}")
+            mp3_title = os.path.splitext(title)[0] + ".mp3"
+            log(f"🎧 Konvertovano: {mp3_title}")
             last_file["name"] = None
 
     ydl_opts = {
@@ -110,7 +110,7 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         ],
         "ignoreerrors": True,
         "noplaylist": False,
-        "ffmpeg_location": ".",  # očekuje ffmpeg.exe i ffprobe.exe u istom folderu
+        # ffmpeg je u PATH (Docker/OS), zato ne navodimo 'ffmpeg_location'
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [hook],
@@ -152,19 +152,28 @@ def index():
     </style>
     <h1>yt-dlp Web UI</h1>
     <p class="muted">⚠️ Poštuj autorska prava i uslove korišćenja YouTube-a.</p>
+
     <label>Playlist ili video URL-ovi (jedan po liniji)</label>
     <textarea id="urls" rows="6"
       placeholder="https://www.youtube.com/watch?v=...&#10;https://www.youtube.com/playlist?list=..."></textarea>
+
     <label>Folder (biće kreiran u Downloads)</label>
     <input id="folder" value="Play Lista 1"/>
+
     <label>MP3 kvalitet (kbps: 128/192/256/320)</label>
     <input id="quality" value="192"/>
+
     <button id="startBtn">Pokreni</button>
+
     <h2>Log</h2>
     <div id="log">Spreman.</div>
+
     <script>
       const logBox = document.getElementById('log');
-      const apiBase = window.location.origin;
+
+      // baza = trenutna putanja (npr. /ytpldl), bez završne kose crte
+      const basePath = window.location.pathname.replace(/\\/$/, '');
+
       let currentJob = null;
       let lastLines = 0;
       let pollTimer = null;
@@ -178,11 +187,13 @@ def index():
         const urls = document.getElementById('urls').value.split('\\n').map(s=>s.trim()).filter(Boolean);
         const folder = document.getElementById('folder').value.trim() || 'yt-dlp-downloads';
         const quality = document.getElementById('quality').value.trim() || '192';
-        const res = await fetch(`${apiBase}/start`, {
+
+        const res = await fetch(`${basePath}/start`, {
           method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({urls,folder,quality})
         });
+
         const data = await res.json();
         currentJob = data.job_id;
         appendLog(`Pokrenut job: ${currentJob}`);
@@ -193,7 +204,7 @@ def index():
         if(pollTimer) clearInterval(pollTimer);
         pollTimer = setInterval(async ()=>{
           if(!currentJob) return;
-          const res = await fetch(`${apiBase}/logs/${currentJob}`);
+          const res = await fetch(`${basePath}/logs/${currentJob}`);
           if(!res.ok) return;
           const data = await res.json();
           const newLines = data.log.slice(lastLines);
@@ -244,4 +255,5 @@ def get_logs(job_id):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Za lokalni rad; u produkciji koristi Gunicorn iza Nginx-a
+    app.run(host="0.0.0.0", port=8000, debug=True)
