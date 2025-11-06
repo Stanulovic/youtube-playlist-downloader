@@ -7,7 +7,7 @@ import traceback
 import threading
 from collections import deque
 from urllib.parse import quote
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_from_directory
 
 # ================== CONFIG ==================
 DOWNLOAD_ROOT = os.environ.get("DOWNLOAD_ROOT", os.path.join(os.path.expanduser("~"), "Downloads"))
@@ -20,21 +20,19 @@ LOG_FILE_NAME = "failed_downloads.txt"
 jobs = {}
 
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False  # lepši UTF-8 JSON
 
 try:
     import yt_dlp
 except ModuleNotFoundError:
     raise SystemExit("yt_dlp nije instaliran. Pokreni: python -m pip install yt-dlp Flask")
 
-
 # ================== HELPERS ==================
 def sanitize_filename(name: str) -> str:
     return re.sub(r"[\\/*?:\"<>|]", "", name).strip()
 
-
 def clean_title(title: str) -> str:
     return re.sub(r"[\[\(].*?[\]\)]", "", title).strip()
-
 
 def parse_artist_and_title(full_title: str):
     if "-" in full_title:
@@ -44,7 +42,6 @@ def parse_artist_and_title(full_title: str):
         return artist, title
     else:
         return None, sanitize_filename(clean_title(full_title))
-
 
 def post_process_filenames(target_folder: str, log):
     for filename in os.listdir(target_folder):
@@ -56,7 +53,10 @@ def post_process_filenames(target_folder: str, log):
             new_path = os.path.join(target_folder, new_name)
             if os.path.exists(new_path) and new_path != full_path:
                 log(f"⚠️ Duplikat: {new_name} već postoji. Brišem {filename}")
-                os.remove(full_path)
+                try:
+                    os.remove(full_path)
+                except Exception as e:
+                    log(f"⚠️ Ne mogu da obrišem {filename}: {e}")
                 continue
             if new_path != full_path:
                 try:
@@ -65,6 +65,18 @@ def post_process_filenames(target_folder: str, log):
                 except Exception as e:
                     log(f"⚠️ Nije moguće preimenovati {filename}: {e}")
 
+# ================== yt-dlp logger ==================
+class YDLLogger:
+    def __init__(self, logfn): 
+        self.log = logfn
+    def debug(self, msg):
+        # yt-dlp šalje dosta info kroz debug; prikažemo korisne
+        if any(k in msg for k in ("Downloading", "Destination", "has already been downloaded", "Extracting")):
+            self.log(msg)
+    def warning(self, msg): 
+        self.log(f"⚠️ {msg}")
+    def error(self, msg): 
+        self.log(f"❌ {msg}")
 
 # ================== CORE JOB ==================
 def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred_quality: str = "192"):
@@ -89,8 +101,11 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
             pass
 
     def log_failed(url, reason):
-        with open(failed_log_path, "a", encoding="utf-8") as f:
-            f.write(f"{url} - {reason}\n")
+        try:
+            with open(failed_log_path, "a", encoding="utf-8") as f:
+                f.write(f"{url} - {reason}\n")
+        except Exception as e:
+            log(f"⚠️ Ne mogu da upišem u {LOG_FILE_NAME}: {e}")
 
     last_file = {"name": None}
 
@@ -104,12 +119,27 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
             elif d["status"] == "finished" and d.get("filename"):
                 title = os.path.basename(d["filename"])
                 log(f"✅ Skinuto: {title}")
-                mp3_title = os.path.splitext(title)[0] + ".mp3"
-                log(f"🎧 Konvertovano: {mp3_title}")
                 last_file["name"] = None
         except Exception:
             pass
 
+    def pp_hook(d):
+        # Precizan log kad FFmpegExtractAudio završi
+        if d.get("status") == "finished" and d.get("postprocessor") == "FFmpegExtractAudio":
+            try:
+                src = os.path.basename(d.get("info_dict", {}).get("_filename", ""))  # originalni fajl (m4a/webm)
+                base = os.path.splitext(src)[0] + ".mp3"
+                log(f"🎧 Konvertovano: {base}")
+            except Exception:
+                log("🎧 Konverzija završena.")
+
+    # Preflight: obavezan ffmpeg
+    if not shutil.which("ffmpeg"):
+        log("❌ FFmpeg nije instaliran. Instaliraj ffmpeg (dnf/apt/apk) i probaj ponovo.")
+        job["status"] = "error"
+        return
+
+    # yt-dlp opcije
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(target_folder, "%(title)s.%(ext)s"),
@@ -117,11 +147,17 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": preferred_quality}
         ],
-        "ignoreerrors": True,
+        "keepvideo": True,        # zadrži m4a/webm u slučaju da konverzija padne (imaćemo bar nešto)
+        "ignoreerrors": False,    # NE ignorišemo greške, želimo ih u logu
         "noplaylist": False,
-        "quiet": True,
-        "no_warnings": True,
+        "logger": YDLLogger(log),
         "progress_hooks": [hook],
+        "postprocessor_hooks": [pp_hook],
+        # Po želji: stabilniji mix klijenata (nekad pomaže kod restrikcija)
+        # "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        # Ako ti trebaju kolačići (age-restricted/privatne liste), uključi jedan od ova dva pristupa:
+        # "cookiesfrombrowser": ("chrome",),  # ili ("edge",) / ("firefox",)
+        # "cookiefile": "/path/to/cookies.txt",
     }
 
     try:
@@ -137,16 +173,31 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         log("🔧 Obrada fajlova...")
         post_process_filenames(target_folder, log)
 
-        # === ZIP ceo target_folder u PUBLIC_DOWNLOADS ===
+        # === Skupljanje fajlova za ZIP (preferiramo .mp3, ali fallback na .m4a/.webm) ===
+        files_to_zip = []
+        for root, _, files in os.walk(target_folder):
+            for f in files:
+                if f.lower().endswith((".mp3", ".m4a", ".webm")):
+                    full = os.path.join(root, f)
+                    files_to_zip.append(full)
+
+        if not files_to_zip:
+            log("❌ Nema generisanih audio fajlova (.mp3/.m4a/.webm). Proveri linkove i/ili ffmpeg/cookies.")
+            job["status"] = "error"
+            return
+
+        # === ZIP u PUBLIC_DOWNLOADS ===
         zip_name = f"{safe_subdir}.zip"
         tmp_zip_path = os.path.join(target_folder, zip_name)
-        with zipfile.ZipFile(tmp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(target_folder):
-                for f in files:
-                    if f.lower().endswith(".mp3"):
-                        full = os.path.join(root, f)
-                        arc = os.path.relpath(full, start=target_folder)
-                        zf.write(full, arcname=arc)
+        try:
+            with zipfile.ZipFile(tmp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for full in files_to_zip:
+                    arc = os.path.relpath(full, start=target_folder)
+                    zf.write(full, arcname=arc)
+        except Exception as e:
+            log(f"⚠️ Neuspešno pakovanje ZIP-a: {e}")
+            job["status"] = "error"
+            return
 
         final_zip_path = os.path.join(PUBLIC_DOWNLOADS, zip_name)
         try:
@@ -157,7 +208,10 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
                 os.remove(tmp_zip_path)
             except Exception as e:
                 log(f"⚠️ Ne mogu da kopiram ZIP u public: {e}")
+                job["status"] = "error"
+                return
 
+        # Link ka ruti koja servira public downloads (radi i bez Nginx-a)
         public_link = f"/ytpldl/downloads/{quote(zip_name)}"
         job["public_zip"] = public_link
         log(f"📦 ZIP spreman: {public_link}")
@@ -168,7 +222,6 @@ def run_job(job_id: str, playlist_urls: list[str], target_subdir: str, preferred
         log(f"💥 Fatal error: {e}")
         traceback.print_exc()
         job["status"] = "error"
-
 
 # ================== ROUTES ==================
 @app.route("/")
@@ -190,7 +243,7 @@ def index():
     <label>Playlist ili video URL-ovi (jedan po liniji)</label>
     <textarea id="urls" rows="6"
       placeholder="https://www.youtube.com/playlist?list=...&#10;https://www.youtube.com/watch?v=..."></textarea>
-    <label>Upisi naizv playliste/ZIP-a</label>
+    <label>Upiši naziv playliste/ZIP-a</label>
     <input id="folder" value=""/>
     <label>MP3 kvalitet (kbps: 128/192/256/320)</label>
     <input id="quality" value="192"/>
@@ -216,6 +269,10 @@ def index():
           body:JSON.stringify({urls,folder,quality})
         });
         const data = await res.json();
+        if(data.error){
+          appendLog('❌ ' + data.error);
+          return;
+        }
         currentJob = data.job_id;
         appendLog(`Pokrenut job: ${currentJob}`);
         startPolling();
@@ -239,6 +296,7 @@ def index():
               a.href=data.public_zip;
               a.textContent='⬇️ Preuzmi ZIP';
               a.className='btn';
+              a.download = '';
               logBox.insertAdjacentElement('afterend',a);
             }
           }
@@ -246,7 +304,6 @@ def index():
       }
     </script>"""
     return Response(html, mimetype="text/html")
-
 
 @app.route("/start", methods=["POST"])
 def start_job():
@@ -264,7 +321,6 @@ def start_job():
     t.start()
     return jsonify({"job_id": job_id})
 
-
 @app.route("/logs/<job_id>")
 def get_logs(job_id):
     job = jobs.get(job_id)
@@ -272,6 +328,11 @@ def get_logs(job_id):
         return jsonify({"error": "Nepoznat job."}), 404
     return jsonify({"status": job["status"], "log": list(job["log"]), "public_zip": job.get("public_zip")})
 
+# Serviranje ZIP-ova iz PUBLIC_DOWNLOADS (radi i bez Nginx proxy-ja)
+@app.route("/ytpldl/downloads/<path:filename>")
+def download_file(filename):
+    # security: servira samo iz PUBLIC_DOWNLOADS
+    return send_from_directory(PUBLIC_DOWNLOADS, filename, as_attachment=True)
 
 @app.errorhandler(Exception)
 def handle_all_errors(e):
@@ -280,7 +341,6 @@ def handle_all_errors(e):
     print(trace)
     return jsonify({"error": str(e), "type": e.__class__.__name__}), 500
 
-
 if __name__ == "__main__":
+    # Pokretanje
     app.run(host="0.0.0.0", port=8000, debug=True)
-
